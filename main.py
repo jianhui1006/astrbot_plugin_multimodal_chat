@@ -8,7 +8,7 @@ import traceback
 from astrbot.api import AstrBotConfig
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, register
 
 try:
@@ -121,14 +121,51 @@ class MultimodalChat(Star):
                 "[diag] 当前 provider_wake_prefix 不是 '/'，标准 command 过滤器会受此影响。"
             )
 
+    @staticmethod
+    def _extract_message_text(event: AstrMessageEvent) -> str:
+        plain_components = [
+            comp.text for comp in event.get_messages() if isinstance(comp, Plain) and comp.text
+        ]
+        if plain_components:
+            return " ".join(plain_components).strip()
+        return (event.message_str or "").strip()
+
     async def initialize(self):
         logger.info("astrbot_plugin_multimodal_chat 初始化完成")
         self._log_current_config(stage="initialize")
         self._log_runtime_diagnostics()
 
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
+    async def fallback_message_router(self, event: AstrMessageEvent):
+        """兜底命令路由：当标准 command 过滤链未命中时，仍能处理 /生成 与 /编辑。"""
+        if event.get_extra("mmc_routed", False):
+            return
+
+        text = self._extract_message_text(event)
+        if not text.startswith("/"):
+            return
+
+        trace = self._event_trace(event)
+        if re.match(r"^/(?:生成|gen|genimg)(?:\s|$)", text):
+            event.set_extra("mmc_routed", True)
+            logger.info(f"[fallback] 命中兜底生图路由 | {trace} | raw_input={text!r}")
+            async for result in self.generate_image(event):
+                yield result
+            event.stop_event()
+            return
+
+        if re.match(r"^/(?:编辑|edit|editimg)(?:\s|$)", text):
+            event.set_extra("mmc_routed", True)
+            logger.info(f"[fallback] 命中兜底编辑路由 | {trace} | raw_input={text!r}")
+            async for result in self.edit_image(event):
+                yield result
+            event.stop_event()
+            return
+
     @filter.command("编辑", alias={"edit", "editimg"})
     async def edit_image(self, event: AstrMessageEvent):
         """编辑用户发送的图片并返回结果。"""
+        event.set_extra("mmc_routed", True)
         trace = self._event_trace(event)
         started_at = time.perf_counter()
         logger.info(f"[/edit] 收到请求 | {trace} | raw_input={event.message_str!r}")
@@ -200,6 +237,7 @@ class MultimodalChat(Star):
     @filter.command("生成", alias={"gen", "genimg"})
     async def generate_image(self, event: AstrMessageEvent):
         """根据提示词生成图片并返回结果。"""
+        event.set_extra("mmc_routed", True)
         trace = self._event_trace(event)
         started_at = time.perf_counter()
         logger.info(f"[/gen] 收到请求 | {trace} | raw_input={event.message_str!r}")
