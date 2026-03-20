@@ -1,0 +1,20 @@
+{
+  "api_base": {
+    "description": "服务商的API地址",
+    "type": "string"
+  },
+  "api_key": {
+    "description": "服务商的API密钥",
+    "type": "string"
+  },
+  "prefix": {
+    "description": "调用方式前缀，如openai/gemini等，最终调用方式为prefix/model",
+    "type": "string",
+    "default": "openai"
+  },
+  "model": {
+    "description": "使用的模型名称",
+    "type": "string",
+    "default": "gemini-3.1-flash-image-preview"
+  }
+}
