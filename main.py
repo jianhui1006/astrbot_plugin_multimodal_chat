@@ -23,11 +23,15 @@ class MultimodalChat(Star):
         super().__init__(context)
         self.config = config
         self.llm_service = LLMService(config)
+        self._log_current_config(stage="__init__")
 
     @staticmethod
-    def _extract_prompt(message: str, command_name: str) -> str:
+    def _extract_prompt(message: str, command_names: list[str]) -> str:
         text = (message or "").strip()
-        text = re.sub(rf"^/?{re.escape(command_name)}(?:\s+|$)", "", text, count=1)
+        escaped_names = [re.escape(name) for name in command_names if name]
+        escaped_names.sort(key=len, reverse=True)
+        pattern = rf"^/?(?:{'|'.join(escaped_names)})(?:\s+|$)"
+        text = re.sub(pattern, "", text, count=1)
         return text.strip()
 
     @staticmethod
@@ -69,18 +73,69 @@ class MultimodalChat(Star):
             f"platform={event.get_platform_name()}"
         )
 
+    @staticmethod
+    def _mask_key(raw: str) -> str:
+        value = (raw or "").strip()
+        if not value:
+            return "<empty>"
+        if len(value) <= 8:
+            return value[0] + "***" + value[-1]
+        return f"{value[:4]}***{value[-4:]}"
+
+    def _config_snapshot(self) -> str:
+        api_base = str(self.config.get("api_base", "")).strip()
+        api_key = str(self.config.get("api_key", "")).strip()
+        prefix = str(self.config.get("prefix", "")).strip()
+        model = str(self.config.get("model", "")).strip()
+        return (
+            f"api_base={api_base or '<empty>'} "
+            f"api_key={self._mask_key(api_key)} "
+            f"prefix={prefix or '<empty>'} "
+            f"model={model or '<empty>'}"
+        )
+
+    def _log_current_config(self, stage: str) -> None:
+        logger.info(f"[config] stage={stage} | {self._config_snapshot()}")
+
+    def _refresh_runtime_config(self, trace: str, command_name: str) -> None:
+        self.llm_service.reload_config(self.config)
+        self._log_current_config(stage=f"{command_name}.runtime")
+        api_key = str(self.config.get("api_key", "")).strip()
+        if not api_key:
+            logger.warning(f"[{command_name}] 检测到 api_key 为空，调用会失败 | {trace}")
+
+    def _log_runtime_diagnostics(self) -> None:
+        try:
+            global_cfg = self.context.get_config()
+            wake_prefix = str(global_cfg.get("provider_wake_prefix", "")).strip()
+        except Exception:
+            wake_prefix = "<unknown>"
+        logger.info(
+            "[diag] plugin_loaded | "
+            f"file={__file__} | "
+            "commands=生成/gen/genimg, 编辑/edit/editimg | "
+            f"provider_wake_prefix={wake_prefix or '<empty>'}",
+        )
+        if wake_prefix and wake_prefix != "/":
+            logger.warning(
+                "[diag] 当前 provider_wake_prefix 不是 '/'，标准 command 过滤器会受此影响。"
+            )
+
     async def initialize(self):
         logger.info("astrbot_plugin_multimodal_chat 初始化完成")
+        self._log_current_config(stage="initialize")
+        self._log_runtime_diagnostics()
 
-    @filter.command("edit")
+    @filter.command("编辑", alias={"edit", "editimg"})
     async def edit_image(self, event: AstrMessageEvent):
         """编辑用户发送的图片并返回结果。"""
         trace = self._event_trace(event)
         started_at = time.perf_counter()
         logger.info(f"[/edit] 收到请求 | {trace} | raw_input={event.message_str!r}")
+        self._refresh_runtime_config(trace, "/edit")
 
         logger.info(f"[/edit] 开始解析指令参数 | {trace}")
-        prompt = self._extract_prompt(event.message_str, "edit")
+        prompt = self._extract_prompt(event.message_str, ["编辑", "edit", "editimg"])
         prompt, aspect_ratio = self._extract_aspect_ratio(prompt)
         logger.info(
             f"[/edit] 参数解析完成 | {trace} | prompt_len={len(prompt)} | aspect_ratio={aspect_ratio}"
@@ -101,7 +156,7 @@ class MultimodalChat(Star):
             logger.info(f"[/edit] 开始处理输入图片 | {trace}")
             input_image_base64 = await image_comp.convert_to_base64()
             logger.info(
-                f"[/edit] 输入图片准备完成 | {trace} | image_b64_len={len(input_image_base64)} | model={self.llm_service.model}"
+                f"[/edit] 输入图片准备完成 | {trace} | image_b64_len={len(input_image_base64)} | model={self.llm_service._build_model_name()}"
             )
             logger.info(f"[/edit] 开始调用图像编辑模型 | {trace}")
             result = await asyncio.to_thread(
@@ -142,15 +197,16 @@ class MultimodalChat(Star):
             yield event.image_result(image_path)
         logger.info(f"[/edit] 请求处理结束 | {trace}")
 
-    @filter.command("gen")
+    @filter.command("生成", alias={"gen", "genimg"})
     async def generate_image(self, event: AstrMessageEvent):
         """根据提示词生成图片并返回结果。"""
         trace = self._event_trace(event)
         started_at = time.perf_counter()
         logger.info(f"[/gen] 收到请求 | {trace} | raw_input={event.message_str!r}")
+        self._refresh_runtime_config(trace, "/gen")
 
         logger.info(f"[/gen] 开始解析指令参数 | {trace}")
-        prompt = self._extract_prompt(event.message_str, "gen")
+        prompt = self._extract_prompt(event.message_str, ["生成", "gen", "genimg"])
         prompt, aspect_ratio = self._extract_aspect_ratio(prompt)
         logger.info(
             f"[/gen] 参数解析完成 | {trace} | prompt_len={len(prompt)} | aspect_ratio={aspect_ratio}"
@@ -162,7 +218,9 @@ class MultimodalChat(Star):
             return
 
         try:
-            logger.info(f"[/gen] 开始调用生图模型 | {trace} | model={self.llm_service.model}")
+            logger.info(
+                f"[/gen] 开始调用生图模型 | {trace} | model={self.llm_service._build_model_name()}"
+            )
             result = await asyncio.to_thread(
                 self.llm_service.generate_image,
                 prompt,
